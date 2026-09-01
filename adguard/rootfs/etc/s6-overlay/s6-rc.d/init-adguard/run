@@ -1,0 +1,133 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# shellcheck disable=SC2207
+# ==============================================================================
+# AdGuard Home Plus
+# Handles configuration
+# ==============================================================================
+readonly CONFIG_DIR="/config"
+readonly CONFIG="${CONFIG_DIR}/AdGuardHome.yaml"
+readonly OLD_CONFIG="/data/adguard/AdGuardHome.yaml"
+readonly NETWORK_WAIT_SECONDS=300
+readonly NETWORK_POLL_SECONDS=5
+declare network_ready="false"
+declare schema_version
+declare -a interfaces
+declare -a hosts
+declare part
+declare fd
+declare a2
+
+# Ensure runtime data directory exists
+mkdir -p /data/adguard
+
+if ! bashio::fs.file_exists "${CONFIG}"; then
+    if bashio::fs.file_exists "${OLD_CONFIG}"; then
+        bashio::log.info "Migrating AdGuardHome.yaml from /data/adguard/ to ${CONFIG_DIR}/"
+        cp "${OLD_CONFIG}" "${CONFIG}"
+        mv "${OLD_CONFIG}" "${OLD_CONFIG}.bak"
+        bashio::log.info "Old config backed up as AdGuardHome.yaml.bak in /data/adguard/"
+    else
+        bashio::log.info "Creating default AdGuardHome.yaml in ${CONFIG_DIR}/"
+        cp /etc/adguard/AdGuardHome.yaml "${CONFIG}"
+    fi
+fi
+
+port=$(bashio::app.port "53/udp") \
+  yq e --inplace '.dns.port = env(port)' "${CONFIG}" \
+    || bashio::exit.nok 'Failed updating AdGuardHome DNS port'
+
+schema_version=$(yq e '.schema_version // ""' "${CONFIG}")
+if bashio::var.has_value "${schema_version}"; then
+    if (( schema_version == 7 )); then
+        yq --inplace e 'del(.dns.bind_host)' "${CONFIG}"
+        yq --inplace e '.schema_version = 8' "${CONFIG}"
+    fi
+
+    if (( schema_version < 7 )); then
+        yq --inplace e '.dns.bind_host = "127.0.0.1"' "${CONFIG}"
+        bashio::log.warning
+        bashio::log.warning "AdGuard Home needs to update its configuration schema"
+        bashio::log.warning "you might need to restart the app once more to complete"
+        bashio::log.warning "the upgrade process."
+        bashio::log.warning
+        bashio::exit.ok
+    fi
+else
+    yq --inplace e '.dns.bind_host = "127.0.0.1"' "${CONFIG}"
+fi
+
+function has_usable_address() {
+    local interface
+    local host
+
+    for interface in $(bashio::network.interfaces); do
+        for host in $(bashio::network.ipv4_address "${interface}"); do
+            if [[ "${host}" == 169.254.* ]]; then
+                continue
+            fi
+            return "${__BASHIO_EXIT_OK}"
+        done
+    done
+
+    return "${__BASHIO_EXIT_NOK}"
+}
+
+for (( waited = 0; waited < NETWORK_WAIT_SECONDS; waited += NETWORK_POLL_SECONDS )); do
+    if has_usable_address; then
+        network_ready="true"
+        break
+    fi
+
+    if (( waited == 0 )); then
+        bashio::log.info "Waiting for the host network to become available..."
+    fi
+
+    sleep "${NETWORK_POLL_SECONDS}"
+
+    bashio::cache.flush_all
+done
+
+if ! bashio::var.true "${network_ready}"; then
+    bashio::log.warning
+    bashio::log.warning "No usable IPv4 address found after ${NETWORK_WAIT_SECONDS} seconds."
+    bashio::log.warning "AdGuard Home will only listen on the addresses known"
+    bashio::log.warning "right now. If clients cannot reach it, restart this app"
+    bashio::log.warning "once the network is up."
+    bashio::log.warning
+fi
+
+interfaces+=($(bashio::network.interfaces))
+for interface in "${interfaces[@]}"; do
+    for host in $(bashio::network.ipv4_address "${interface}"); do
+        hosts+=("${host%/*}")
+    done
+    for host in $(bashio::network.ipv6_address "${interface}"); do
+        part="${host%%:*}"
+        fd=$(( (0x$part) / 256 ))
+        a2=$(( (0x$part) % 256 ))
+        if (( (fd == 254) && ( (a2 & 192) == 128) )); then
+            hosts+=("${host%/*}%${interface}")
+        else
+            hosts+=("${host%/*}")
+        fi
+    done
+done
+hosts+=($(bashio::app.ip_address))
+hosts+=("127.0.0.1")
+hosts+=("::1")
+
+yq --inplace e '.dns.bind_hosts = []' "${CONFIG}"
+for host in "${hosts[@]}"; do
+    if ! bashio::var.has_value "${host}"; then
+        continue
+    fi
+    if [[ "${host}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ "${host}" == 169.254.* ]]; then
+            continue
+        fi
+    fi
+    host="${host}" yq --inplace e \
+      '.dns.bind_hosts += [env(host)]' "${CONFIG}" \
+        || bashio::exit.nok 'Failed updating AdGuardHome host'
+done
